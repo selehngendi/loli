@@ -246,18 +246,37 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
     # Legacy code kept inert — will re-enable when curse returns.
     # (was: _check_curse → whisper answer to guardian)
 
-    # ── Priority 2b: Guardian threat evasion (v1.5.2) ─────────────
-    # Guardians now ATTACK player agents directly! Flee if low HP.
+    # ── Priority 2b: Threat evasion (guardians + strong enemies) ───
+    # Build enemies list early (needed for multiple checks below)
+    enemies = [a for a in visible_agents
+               if not a.get("isGuardian", False) and a.get("isAlive", True)
+               and a.get("id") != self_data.get("id")]
     guardians_here = [a for a in visible_agents
                       if a.get("isGuardian", False) and a.get("isAlive", True)
                       and a.get("regionId") == region_id]
-    if guardians_here and hp < 40 and ep >= move_ep_cost:
-        # Low HP + guardian in same region = flee!
+    enemies_here = [e for e in enemies if e.get("regionId") == region_id]
+
+    # Flee from guardians when HP low
+    if guardians_here and hp < GUARDIAN_FARM_MIN_HP and ep >= move_ep_cost:
         safe = _find_safe_region(connections, danger_ids, view)
         if safe:
-            log.warning("⚠️ Guardian threat! HP=%d, fleeing to safety", hp)
+            log.warning("⚠️ Guardian threat! HP=%d, fleeing", hp)
             return {"action": "move", "data": {"regionId": safe},
-                    "reason": f"GUARDIAN FLEE: HP={hp}, guardian in region, too dangerous"}
+                    "reason": f"GUARDIAN FLEE: HP={hp}, too dangerous"}
+
+    # Flee from strong enemies (they deal more damage than us)
+    if enemies_here and hp < 50 and ep >= move_ep_cost:
+        my_bonus = get_weapon_bonus(equipped)
+        for enemy in enemies_here:
+            e_dmg = calc_damage(enemy.get("atk", 10), _estimate_enemy_weapon_bonus(enemy), defense, region_weather)
+            my_dmg = calc_damage(atk, my_bonus, enemy.get("def", 5), region_weather)
+            if e_dmg > my_dmg * 1.3 and hp < e_dmg * 3:  # Enemy hits harder + we die in ~3 hits
+                safe = _find_safe_region(connections, danger_ids, view)
+                if safe:
+                    log.warning("⚠️ Outmatched! Enemy dmg=%d vs ours=%d, fleeing", e_dmg, my_dmg)
+                    return {"action": "move", "data": {"regionId": safe},
+                            "reason": f"FLEE: Outmatched enemy dmg={e_dmg} vs {my_dmg}, HP={hp}"}
+                break
 
     # ── FREE ACTIONS (no cooldown, do before main action) ─────────
 
@@ -282,18 +301,23 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
 
     # (Death zone escape already handled above as Priority 1)
 
-    # ── Priority 3: Healing management (configurable thresholds) ───
+    # ── Priority 3: Healing management ──────────────────────────────
     if hp < HP_CRITICAL_THRESHOLD:
         heal = _find_healing_item(inventory, critical=True)
         if heal:
             return {"action": "use_item", "data": {"itemId": heal["id"]},
                     "reason": f"CRITICAL HEAL: HP={hp}<{HP_CRITICAL_THRESHOLD}, using {heal.get('typeId', 'heal')}"}
-    elif hp < HP_MODERATE_THRESHOLD and not enemies:
-        # Only moderate heal if no enemies nearby (don't waste turn)
+    elif hp < HP_MODERATE_THRESHOLD and not enemies_here:
         heal = _find_healing_item(inventory, critical=False)
         if heal:
             return {"action": "use_item", "data": {"itemId": heal["id"]},
-                    "reason": f"HEAL: HP={hp}<{HP_MODERATE_THRESHOLD}, safe area, using {heal.get('typeId', 'heal')}"}
+                    "reason": f"HEAL: HP={hp}, safe area, using {heal.get('typeId', 'heal')}"}
+
+    # ── EP Conservation: save EP for DZ escape if pending DZ nearby ─
+    dz_threatening = region_id in danger_ids or any(
+        _get_region_id(c) in danger_ids for c in connections
+    )
+    ep_reserve = move_ep_cost if dz_threatening else 0
 
     # ── Priority 4: EP recovery if EP=0 ───────────────────────────
     if ep == 0:
@@ -316,26 +340,22 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                                   f"(120 sMoltz! dmg={target['my_dmg']} vs {target['enemy_dmg']})"}
 
     # ── Priority 6: Favorable agent combat ────────────────────────
-    # Adaptive aggression based on AGGRESSION_LEVEL config + game phase
-    enemies = [a for a in visible_agents
-               if not a.get("isGuardian", False) and a.get("isAlive", True)
-               and a.get("id") != self_data.get("id")]
     hp_threshold = _get_combat_hp_threshold(alive_count, equipped)
-    # Avoid combat in storm/fog unless we have ranged advantage
     weather_ok = region_weather not in ("storm", "fog") or get_weapon_range(equipped) >= 1
-    if enemies and ep >= COMBAT_MIN_EP and hp >= hp_threshold and weather_ok:
+    has_ep_for_combat = ep >= (COMBAT_MIN_EP + ep_reserve)  # Keep EP reserve for DZ
+    if enemies and has_ep_for_combat and hp >= hp_threshold and weather_ok:
         target = _select_best_target(enemies, atk, equipped, defense, region_weather)
         if target:
             w_range = get_weapon_range(equipped)
             if _is_in_range(target["agent"], region_id, w_range, connections):
                 return {"action": "attack",
                         "data": {"targetId": target["agent"]["id"], "targetType": "agent"},
-                        "reason": f"COMBAT: Target HP={target['agent'].get('hp', '?')}, "
-                                  f"dmg={target['my_dmg']} vs enemy_dmg={target['enemy_dmg']}"}
+                        "reason": f"COMBAT: HP={target['agent'].get('hp','?')} "
+                                  f"dmg={target['my_dmg']} vs {target['enemy_dmg']}"}
 
-    # ── Priority 7: Monster farming ───────────────────────────────
+    # ── Priority 7: Monster farming (only when EP is abundant) ────
     monsters = [m for m in visible_monsters if m.get("hp", 0) > 0]
-    if monsters and ep >= 2:
+    if monsters and ep >= (COMBAT_MIN_EP + ep_reserve) and hp >= 30:
         target = _select_weakest(monsters)
         w_range = get_weapon_range(equipped)
         if _is_in_range(target, region_id, w_range, connections):
@@ -344,7 +364,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                     "reason": f"MONSTER FARM: {target.get('name', 'monster')} HP={target.get('hp', '?')}"}
 
     # ── Priority 7b: Moderate healing (safe area, no enemies) ─────
-    if hp < HP_MODERATE_THRESHOLD and not enemies:
+    if hp < HP_MODERATE_THRESHOLD and not enemies_here:
         heal = _find_healing_item(inventory, critical=(hp < HP_CRITICAL_THRESHOLD))
         if heal:
             return {"action": "use_item", "data": {"itemId": heal["id"]},
@@ -368,7 +388,7 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                     "reason": "EXPLORE: Moving to better position"}
 
     # ── Priority 10: Rest (EP < 4 and safe) ───────────────────────
-    if ep < 4 and not enemies and not region.get("isDeathZone") and region_id not in danger_ids:
+    if ep < 4 and not enemies_here and not region.get("isDeathZone") and region_id not in danger_ids:
         return {"action": "rest", "data": {},
                 "reason": f"REST: EP={ep}/{max_ep}, area is safe (+1 bonus EP)"}
 
