@@ -36,7 +36,12 @@ class MoltyAPI:
             )
 
     def _headers(self) -> dict:
-        h = {"X-Version": SKILL_VERSION}
+        h = {
+            "X-Version": SKILL_VERSION,
+            "User-Agent": f"MoltyRoyaleAgent/{SKILL_VERSION}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
         if self.api_key:
             h["X-API-Key"] = self.api_key
         return h
@@ -74,6 +79,18 @@ class MoltyAPI:
         if resp.status_code == 429:
             log.warning("Rate limited (429). Backing off.")
             raise APIError("RATE_LIMITED", "Too many requests", 429)
+
+        # Handle HTTP-level errors before JSON parsing
+        if resp.status_code == 403:
+            log.error("403 Forbidden from %s %s — possible WAF/IP block", method, path)
+            raise APIError("FORBIDDEN", f"403 Forbidden from {path}. Server may be blocking this IP or missing auth.", 403)
+
+        if resp.status_code == 401:
+            raise APIError("UNAUTHORIZED", f"401 Unauthorized from {path}. Check API key.", 401)
+
+        if resp.status_code >= 500:
+            log.error("Server error %d from %s %s", resp.status_code, method, path)
+            raise APIError("SERVER_ERROR", f"Server returned {resp.status_code}", resp.status_code)
 
         data = self._safe_parse_json(resp.text)
 

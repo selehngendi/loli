@@ -156,18 +156,32 @@ async def run_first_run_intake() -> dict:
             raise ValueError("Missing or invalid Owner EOA address")
         update_env_file("OWNER_EOA", owner_address)
 
-    # Step 4: Create account via API
+    # Step 4: Create account via API (with retry for 403/transient errors)
     log.info("Creating account via POST /accounts...")
     api = MoltyAPI()
-    try:
-        result = await api.create_account(agent_name, agent_address)
-    except APIError as e:
-        if e.code == "CONFLICT":
-            log.warning("Wallet already registered. Loading existing credentials.")
-            return load_credentials() or {}
-        raise
-    finally:
-        await api.close()
+    result = None
+    max_retries = 5
+    for attempt in range(1, max_retries + 1):
+        try:
+            result = await api.create_account(agent_name, agent_address)
+            break  # Success
+        except APIError as e:
+            if e.code == "CONFLICT":
+                log.warning("Wallet already registered. Loading existing credentials.")
+                await api.close()
+                return load_credentials() or {}
+            if e.code in ("FORBIDDEN", "SERVER_ERROR") and attempt < max_retries:
+                wait = 30 * attempt  # 30s, 60s, 90s...
+                log.warning("Account creation failed (%s), retry %d/%d in %ds...",
+                            e.code, attempt, max_retries, wait)
+                await asyncio.sleep(wait)
+                continue
+            log.error("Account creation failed permanently: %s", e)
+            raise
+    await api.close()
+
+    if not result:
+        raise RuntimeError("POST /accounts failed after all retries")
 
     api_key = result.get("apiKey", "")
     account_id = result.get("accountId", "")
