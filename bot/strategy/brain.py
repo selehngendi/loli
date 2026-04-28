@@ -326,11 +326,15 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
             return {"action": "use_item", "data": {"itemId": energy_drink["id"]},
                     "reason": "EP RECOVERY: EP=0, using energy drink (+5 EP)"}
 
-    # ── Priority 5: Guardian farming (v1.5.2: 120 sMoltz per kill!) ─
+    # ── Priority 5: Guardian farming (120 sMoltz per kill!) ────────
+    # Only farm if: HP is safe + we can win the fight
     guardians = [a for a in visible_agents
                  if a.get("isGuardian", False) and a.get("isAlive", True)]
-    if guardians and ep >= COMBAT_MIN_EP and hp >= GUARDIAN_FARM_MIN_HP:
-        target = _select_best_target(guardians, atk, equipped, defense, region_weather)
+    if guardians and ep >= (COMBAT_MIN_EP + ep_reserve) and hp >= GUARDIAN_FARM_MIN_HP:
+        target = _select_best_target(
+            guardians, atk, equipped, defense, region_weather,
+            my_hp=hp, alive_count=alive_count
+        )
         if target:
             w_range = get_weapon_range(equipped)
             if _is_in_range(target["agent"], region_id, w_range, connections):
@@ -339,19 +343,27 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                         "reason": f"GUARDIAN FARM: HP={target['agent'].get('hp','?')} "
                                   f"(120 sMoltz! dmg={target['my_dmg']} vs {target['enemy_dmg']})"}
 
-    # ── Priority 6: Favorable agent combat ────────────────────────
+    # ── Priority 6: Favorable agent combat + kiting ─────────────────
     hp_threshold = _get_combat_hp_threshold(alive_count, equipped)
     weather_ok = region_weather not in ("storm", "fog") or get_weapon_range(equipped) >= 1
-    has_ep_for_combat = ep >= (COMBAT_MIN_EP + ep_reserve)  # Keep EP reserve for DZ
+    has_ep_for_combat = ep >= (COMBAT_MIN_EP + ep_reserve)
     if enemies and has_ep_for_combat and hp >= hp_threshold and weather_ok:
-        target = _select_best_target(enemies, atk, equipped, defense, region_weather)
+        target = _select_best_target(
+            enemies, atk, equipped, defense, region_weather,
+            my_hp=hp, alive_count=alive_count
+        )
         if target:
             w_range = get_weapon_range(equipped)
             if _is_in_range(target["agent"], region_id, w_range, connections):
-                return {"action": "attack",
-                        "data": {"targetId": target["agent"]["id"], "targetType": "agent"},
-                        "reason": f"COMBAT: HP={target['agent'].get('hp','?')} "
-                                  f"dmg={target['my_dmg']} vs {target['enemy_dmg']}"}
+                action = {"action": "attack",
+                          "data": {"targetId": target["agent"]["id"], "targetType": "agent"},
+                          "reason": f"COMBAT: HP={target['agent'].get('hp','?')} "
+                                    f"dmg={target['my_dmg']} vs {target['enemy_dmg']}"}
+                # Kiting: if we should kite, plan to retreat next turn
+                # (return attack action now; movement happens next turn)
+                if target.get("should_kite"):
+                    log.info("🏹 Kiting: attack now, retreat next turn")
+                return action
 
     # ── Priority 7: Monster farming (only when EP is abundant) ────
     monsters = [m for m in visible_monsters if m.get("hp", 0) > 0]
@@ -418,40 +430,83 @@ def _estimate_enemy_weapon_bonus(agent: dict) -> int:
 
 
 def _select_best_target(targets: list, my_atk: int, my_equipped,
-                        my_def: int, weather: str) -> dict | None:
-    """Smart target selection: pick the most favorable fight.
-    Returns dict with {agent, my_dmg, enemy_dmg} or None if no favorable target.
-    Considers: damage ratio, target HP (finish off low HP), weapon advantage.
+                        my_def: int, weather: str,
+                        my_hp: int = 100, alive_count: int = 100) -> dict | None:
+    """Smart target selection — pick the most favorable fight.
+    Returns dict with {agent, my_dmg, enemy_dmg, should_kite} or None.
+    Priorities:
+    1. Wounded enemies we can ONE-SHOT (free kill!)
+    2. Enemies where we have clear damage advantage
+    3. Late game: take riskier fights when alive_count < 10
     """
     my_bonus = get_weapon_bonus(my_equipped)
     best = None
     best_score = -999
+    is_late_game = alive_count <= 10
+    is_endgame = alive_count <= 5
 
     for t in targets:
         t_def = t.get("def", 5)
         t_atk = t.get("atk", 10)
-        t_hp = t.get("hp", 100)
+        t_hp  = t.get("hp", 100)
         t_weapon_bonus = _estimate_enemy_weapon_bonus(t)
 
-        my_dmg = calc_damage(my_atk, my_bonus, t_def, weather)
+        my_dmg    = calc_damage(my_atk, my_bonus, t_def, weather)
         enemy_dmg = calc_damage(t_atk, t_weapon_bonus, my_def, weather)
 
-        # Score: favor high damage ratio, low HP targets, finish-off opportunities
         if my_dmg <= 0:
             continue
-        turns_to_kill = max(1, t_hp // my_dmg)
-        score = (my_dmg - enemy_dmg) * 2  # Damage advantage
-        if t_hp <= my_dmg:
-            score += 100  # One-shot kill!
-        elif t_hp <= my_dmg * 2:
-            score += 50   # Two-shot kill
-        score -= turns_to_kill * 3  # Penalize tanky targets
 
-        # Only fight if we deal more damage OR can finish quickly
-        if my_dmg >= enemy_dmg or t_hp <= my_dmg * 3:
-            if score > best_score:
-                best_score = score
-                best = {"agent": t, "my_dmg": my_dmg, "enemy_dmg": enemy_dmg}
+        turns_to_kill  = max(1, t_hp // max(my_dmg, 1))
+        turns_to_die   = max(1, my_hp // max(enemy_dmg, 1)) if enemy_dmg > 0 else 999
+        one_shot       = t_hp <= my_dmg
+        two_shot       = t_hp <= my_dmg * 2
+        we_outlast     = turns_to_die > turns_to_kill  # We kill before they kill us
+        we_trade_up    = my_dmg >= enemy_dmg
+
+        # ── Scoring ──────────────────────────────────────────────
+        score = 0
+
+        # One-shot / two-shot = huge bonus (free or cheap kill)
+        if one_shot:
+            score += 200
+        elif two_shot:
+            score += 80
+
+        # Damage advantage
+        score += (my_dmg - enemy_dmg) * 3
+
+        # Survival advantage
+        if we_outlast:
+            score += 40
+        else:
+            score -= (turns_to_kill - turns_to_die) * 20  # Penalty for dying first
+
+        # Late game: be more willing to fight
+        if is_endgame:
+            score += 50
+        elif is_late_game:
+            score += 25
+
+        # Penalize tanky targets that survive long
+        score -= turns_to_kill * 5
+
+        # Only accept fight if:
+        # - We can one/two-shot them, OR
+        # - We have damage advantage AND survive the fight, OR
+        # - Late game (must fight to win)
+        acceptable = (one_shot or two_shot
+                      or (we_trade_up and we_outlast)
+                      or (is_late_game and turns_to_die >= turns_to_kill))
+
+        if acceptable and score > best_score:
+            best_score = score
+            # Kite if: we have ranged weapon AND enemy is stronger
+            should_kite = (get_weapon_range(my_equipped) >= 1
+                           and enemy_dmg > my_dmg
+                           and not one_shot)
+            best = {"agent": t, "my_dmg": my_dmg,
+                    "enemy_dmg": enemy_dmg, "should_kite": should_kite}
 
     return best
 
