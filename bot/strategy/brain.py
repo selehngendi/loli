@@ -24,6 +24,10 @@ Uses ALL view fields from api-summary.md:
 - aliveCount: remaining alive agents
 """
 from bot.utils.logger import get_logger
+from bot.config import (
+    AGGRESSION_LEVEL, HP_CRITICAL_THRESHOLD, HP_MODERATE_THRESHOLD,
+    GUARDIAN_FARM_MIN_HP, COMBAT_MIN_EP,
+)
 
 log = get_logger(__name__)
 
@@ -278,72 +282,56 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
 
     # (Death zone escape already handled above as Priority 1)
 
-    # ── Priority 3: Healing management ─────────────────────────────
-    # HP < 30 = CRITICAL: use Bandage first (30 HP), then Medkit (50 HP)
-    # HP < 70 = MODERATE: use Emergency Food first (20 HP), save better items
-    if hp < 30:
+    # ── Priority 3: Healing management (configurable thresholds) ───
+    if hp < HP_CRITICAL_THRESHOLD:
         heal = _find_healing_item(inventory, critical=True)
         if heal:
             return {"action": "use_item", "data": {"itemId": heal["id"]},
-                    "reason": f"CRITICAL HEAL: HP={hp}, using {heal.get('typeId', 'heal')}"}
-    elif hp < 70:
+                    "reason": f"CRITICAL HEAL: HP={hp}<{HP_CRITICAL_THRESHOLD}, using {heal.get('typeId', 'heal')}"}
+    elif hp < HP_MODERATE_THRESHOLD and not enemies:
+        # Only moderate heal if no enemies nearby (don't waste turn)
         heal = _find_healing_item(inventory, critical=False)
         if heal:
             return {"action": "use_item", "data": {"itemId": heal["id"]},
-                    "reason": f"HEAL: HP={hp}, using {heal.get('typeId', 'heal')}"}
+                    "reason": f"HEAL: HP={hp}<{HP_MODERATE_THRESHOLD}, safe area, using {heal.get('typeId', 'heal')}"}
 
-    # ── Priority 4: EP recovery if cursed (EP=0) or very low ──────
+    # ── Priority 4: EP recovery if EP=0 ───────────────────────────
     if ep == 0:
-        # Check for energy drink first
         energy_drink = _find_energy_drink(inventory)
         if energy_drink:
             return {"action": "use_item", "data": {"itemId": energy_drink["id"]},
                     "reason": "EP RECOVERY: EP=0, using energy drink (+5 EP)"}
 
     # ── Priority 5: Guardian farming (v1.5.2: 120 sMoltz per kill!) ─
-    # Only 5 guardians per free room — each worth 120 sMoltz!
-    # Guardians now ATTACK back — only fight if we can win.
     guardians = [a for a in visible_agents
                  if a.get("isGuardian", False) and a.get("isAlive", True)]
-    if guardians and ep >= 2 and hp >= 35:
-        target = _select_weakest(guardians)
-        w_range = get_weapon_range(equipped)
-        if _is_in_range(target, region_id, w_range, connections):
-            # v1.5.2: guardians fight back — check if we can take them
-            my_dmg = calc_damage(atk, get_weapon_bonus(equipped),
-                                target.get("def", 5), region_weather)
-            guardian_dmg = calc_damage(target.get("atk", 10),
-                                       _estimate_enemy_weapon_bonus(target),
-                                       defense, region_weather)
-            # Fight if we deal more damage OR target is low HP (finish off)
-            if my_dmg >= guardian_dmg or target.get("hp", 100) <= my_dmg * 3:
+    if guardians and ep >= COMBAT_MIN_EP and hp >= GUARDIAN_FARM_MIN_HP:
+        target = _select_best_target(guardians, atk, equipped, defense, region_weather)
+        if target:
+            w_range = get_weapon_range(equipped)
+            if _is_in_range(target["agent"], region_id, w_range, connections):
                 return {"action": "attack",
-                        "data": {"targetId": target["id"], "targetType": "agent"},
-                        "reason": f"GUARDIAN FARM: HP={target.get('hp','?')} "
-                                  f"(120 sMoltz! dmg={my_dmg} vs {guardian_dmg})"}
+                        "data": {"targetId": target["agent"]["id"], "targetType": "agent"},
+                        "reason": f"GUARDIAN FARM: HP={target['agent'].get('hp','?')} "
+                                  f"(120 sMoltz! dmg={target['my_dmg']} vs {target['enemy_dmg']})"}
 
     # ── Priority 6: Favorable agent combat ────────────────────────
-    # Be more aggressive when fewer agents remain (late game)
-    # Per game-systems.md: avoid combat in storm(-15%) or fog(-10%)
-    hp_threshold = 40 if alive_count > 20 else 25
+    # Adaptive aggression based on AGGRESSION_LEVEL config + game phase
     enemies = [a for a in visible_agents
                if not a.get("isGuardian", False) and a.get("isAlive", True)
                and a.get("id") != self_data.get("id")]
-    if enemies and ep >= 2 and hp >= hp_threshold:
-        target = _select_weakest(enemies)
-        w_range = get_weapon_range(equipped)
-        if _is_in_range(target, region_id, w_range, connections):
-            my_dmg = calc_damage(atk, get_weapon_bonus(equipped),
-                                target.get("def", 5), region_weather)
-            enemy_dmg = calc_damage(target.get("atk", 10),
-                                     _estimate_enemy_weapon_bonus(target),
-                                     defense, region_weather)
-            # Fight only if we deal more damage or target is low HP
-            if my_dmg > enemy_dmg or target.get("hp", 100) <= my_dmg * 2:
+    hp_threshold = _get_combat_hp_threshold(alive_count, equipped)
+    # Avoid combat in storm/fog unless we have ranged advantage
+    weather_ok = region_weather not in ("storm", "fog") or get_weapon_range(equipped) >= 1
+    if enemies and ep >= COMBAT_MIN_EP and hp >= hp_threshold and weather_ok:
+        target = _select_best_target(enemies, atk, equipped, defense, region_weather)
+        if target:
+            w_range = get_weapon_range(equipped)
+            if _is_in_range(target["agent"], region_id, w_range, connections):
                 return {"action": "attack",
-                        "data": {"targetId": target["id"], "targetType": "agent"},
-                        "reason": f"COMBAT: Target HP={target.get('hp', '?')}, "
-                                  f"dmg={my_dmg} vs enemy_dmg={enemy_dmg}"}
+                        "data": {"targetId": target["agent"]["id"], "targetType": "agent"},
+                        "reason": f"COMBAT: Target HP={target['agent'].get('hp', '?')}, "
+                                  f"dmg={target['my_dmg']} vs enemy_dmg={target['enemy_dmg']}"}
 
     # ── Priority 7: Monster farming ───────────────────────────────
     monsters = [m for m in visible_monsters if m.get("hp", 0) > 0]
@@ -355,9 +343,9 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                     "data": {"targetId": target["id"], "targetType": "monster"},
                     "reason": f"MONSTER FARM: {target.get('name', 'monster')} HP={target.get('hp', '?')}"}
 
-    # ── Priority 7b: Moderate healing (HP < 70, safe area) ────────
-    if hp < 70 and not enemies:
-        heal = _find_healing_item(inventory, critical=(hp < 30))
+    # ── Priority 7b: Moderate healing (safe area, no enemies) ─────
+    if hp < HP_MODERATE_THRESHOLD and not enemies:
+        heal = _find_healing_item(inventory, critical=(hp < HP_CRITICAL_THRESHOLD))
         if heal:
             return {"action": "use_item", "data": {"itemId": heal["id"]},
                     "reason": f"HEAL: HP={hp}, area safe, using {heal.get('typeId', 'heal')}"}
@@ -371,10 +359,10 @@ def decide_action(view: dict, can_act: bool, memory_temp: dict = None) -> dict |
                     "reason": f"FACILITY: {facility.get('type', 'unknown')}"}
 
     # ── Priority 9: Strategic movement ────────────────────────────
-    # Use connectedRegions — NEVER move into DZ or pending DZ!
     if ep >= move_ep_cost and connections:
         move_target = _choose_move_target(connections, danger_ids,
-                                           region, visible_items, alive_count)
+                                           region, visible_items, alive_count,
+                                           visible_agents, self_data.get("id", ""), hp)
         if move_target:
             return {"action": "move", "data": {"regionId": move_target},
                     "reason": "EXPLORE: Moving to better position"}
@@ -407,6 +395,72 @@ def _estimate_enemy_weapon_bonus(agent: dict) -> int:
         return 0
     type_id = weapon.get("typeId", "").lower() if isinstance(weapon, dict) else ""
     return WEAPONS.get(type_id, {}).get("bonus", 0)
+
+
+def _select_best_target(targets: list, my_atk: int, my_equipped,
+                        my_def: int, weather: str) -> dict | None:
+    """Smart target selection: pick the most favorable fight.
+    Returns dict with {agent, my_dmg, enemy_dmg} or None if no favorable target.
+    Considers: damage ratio, target HP (finish off low HP), weapon advantage.
+    """
+    my_bonus = get_weapon_bonus(my_equipped)
+    best = None
+    best_score = -999
+
+    for t in targets:
+        t_def = t.get("def", 5)
+        t_atk = t.get("atk", 10)
+        t_hp = t.get("hp", 100)
+        t_weapon_bonus = _estimate_enemy_weapon_bonus(t)
+
+        my_dmg = calc_damage(my_atk, my_bonus, t_def, weather)
+        enemy_dmg = calc_damage(t_atk, t_weapon_bonus, my_def, weather)
+
+        # Score: favor high damage ratio, low HP targets, finish-off opportunities
+        if my_dmg <= 0:
+            continue
+        turns_to_kill = max(1, t_hp // my_dmg)
+        score = (my_dmg - enemy_dmg) * 2  # Damage advantage
+        if t_hp <= my_dmg:
+            score += 100  # One-shot kill!
+        elif t_hp <= my_dmg * 2:
+            score += 50   # Two-shot kill
+        score -= turns_to_kill * 3  # Penalize tanky targets
+
+        # Only fight if we deal more damage OR can finish quickly
+        if my_dmg >= enemy_dmg or t_hp <= my_dmg * 3:
+            if score > best_score:
+                best_score = score
+                best = {"agent": t, "my_dmg": my_dmg, "enemy_dmg": enemy_dmg}
+
+    return best
+
+
+def _get_combat_hp_threshold(alive_count: int, equipped) -> int:
+    """Adaptive HP threshold for entering combat.
+    Depends on: game phase (alive count), weapon quality, aggression config.
+    """
+    weapon_bonus = get_weapon_bonus(equipped) if equipped else 0
+
+    # Base thresholds per aggression level
+    if AGGRESSION_LEVEL == "aggressive":
+        base = 20
+    elif AGGRESSION_LEVEL == "passive":
+        base = 50
+    else:  # balanced
+        base = 35
+
+    # Late game: lower threshold (more aggressive when fewer players)
+    if alive_count <= 5:
+        base -= 10
+    elif alive_count <= 15:
+        base -= 5
+
+    # Good weapon = can afford to fight at lower HP
+    if weapon_bonus >= 20:  # sword or better
+        base -= 5
+
+    return max(15, base)  # Never fight below 15 HP
 
 
 # Track observed agents for memory (threat assessment)
@@ -636,24 +690,34 @@ def _is_in_range(target: dict, my_region: str, weapon_range: int,
 
 def _select_facility(interactables: list, hp: int, ep: int) -> dict | None:
     """Select best facility to interact with per game-systems.md.
-    Facilities: supply_cache, medical_facility, watchtower, broadcast_station, cave.
+    Priority: medical (if HP < 80) > supply_cache > watchtower > broadcast_station.
+    Cave = stealth (-2 vision) — AVOID (trap potential, limits awareness).
+    Watchtower = vision boost — HIGH VALUE for scouting.
     """
+    # Score-based selection
+    best = None
+    best_score = -1
     for fac in interactables:
         if not isinstance(fac, dict):
             continue
         if fac.get("isUsed"):
             continue
         ftype = fac.get("type", "").lower()
-        # Priority: medical (if HP < 80) > supply_cache > watchtower > broadcast_station
+        score = 0
         if ftype == "medical_facility" and hp < 80:
-            return fac
-        if ftype == "supply_cache":
-            return fac
-        if ftype == "watchtower":
-            return fac
-        if ftype == "broadcast_station":
-            return fac
-    return None
+            score = 10 + (80 - hp)  # More valuable when HP is lower
+        elif ftype == "supply_cache":
+            score = 8  # Good loot
+        elif ftype == "watchtower":
+            score = 7  # Vision boost = strategic advantage
+        elif ftype == "broadcast_station":
+            score = 3  # Low priority
+        elif ftype == "cave":
+            score = 0  # AVOID: -2 vision = trap, limits awareness
+        if score > best_score:
+            best_score = score
+            best = fac
+    return best if best_score > 0 else None
 
 
 def _track_agents(visible_agents: list, my_id: str, my_region: str):
@@ -740,17 +804,27 @@ def learn_from_map(view: dict):
 
 def _choose_move_target(connections, danger_ids: set,
                          current_region: dict, visible_items: list,
-                         alive_count: int) -> str | None:
+                         alive_count: int, visible_agents: list = None,
+                         my_id: str = "", my_hp: int = 100) -> str | None:
     """Choose best region to move to.
     CRITICAL: NEVER move into a death zone or pending death zone!
+    Enhanced: avoid regions with many enemies when HP is low.
     """
     candidates = []
 
-    # Build set of regions with visible items for attraction
+    # Build set of regions with visible items AND enemy counts
     item_regions = set()
     for item in visible_items:
         if isinstance(item, dict):
             item_regions.add(item.get("regionId", ""))
+
+    enemy_region_count = {}
+    if visible_agents:
+        for a in visible_agents:
+            if isinstance(a, dict) and a.get("isAlive") and a.get("id") != my_id:
+                rid = a.get("regionId", "")
+                if rid:
+                    enemy_region_count[rid] = enemy_region_count.get(rid, 0) + 1
 
     for conn in connections:
         if isinstance(conn, str):
@@ -795,6 +869,20 @@ def _choose_move_target(connections, danger_ids: set,
             # Late game: strong bonus for safe regions
             if alive_count < 30:
                 score += 3
+
+            # ENEMY AVOIDANCE: penalize regions with enemies when HP is low
+            enemy_count = enemy_region_count.get(rid, 0)
+            if enemy_count > 0:
+                if my_hp < 40:
+                    score -= enemy_count * 5  # Strong avoidance when low HP
+                elif AGGRESSION_LEVEL == "aggressive":
+                    score += enemy_count * 1  # Aggressive: seek fights
+                else:
+                    score -= enemy_count * 2  # Balanced: mild avoidance
+
+            # TERRAIN ADVANTAGE: hills = vision +2 = scouting advantage
+            if terrain == "hills":
+                score += 2  # Extra bonus for scouting position
 
             # MAP KNOWLEDGE: prefer center regions learned from Map
             if _map_knowledge.get("revealed") and rid in _map_knowledge.get("safe_center", []):

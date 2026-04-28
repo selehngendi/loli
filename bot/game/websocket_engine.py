@@ -12,6 +12,8 @@ Per game-loop.md:
 """
 import json
 import asyncio
+import time
+import random
 import websockets
 from bot.config import WS_URL, SKILL_VERSION
 from bot.credentials import get_api_key
@@ -70,11 +72,21 @@ class WebSocketEngine:
         self.game_result = None
         self.last_view = None
         self._ping_task = None
+        self._pong_watchdog_task = None
         self._running = False
         self._map_just_used = False  # Track if Map was used for learning
+        self._last_pong_time = 0.0  # Track last pong for timeout detection
         # Dashboard key/name — set by heartbeat before .run()
         self.dashboard_key = agent_id  # fallback to agent_id
         self.dashboard_name = "Agent"
+        # Game stats tracking
+        self._stats = {
+            "messages_received": 0,
+            "actions_sent": 0,
+            "turns_played": 0,
+            "connect_time": 0.0,
+            "reconnects": 0,
+        }
 
     async def run(self) -> dict:
         """
@@ -89,7 +101,7 @@ class WebSocketEngine:
 
         self._running = True
         retry_count = 0
-        max_retries = 5
+        max_retries = 20  # Increased for 24/7 deployment reliability
 
         while self._running and retry_count < max_retries:
             try:
@@ -101,11 +113,16 @@ class WebSocketEngine:
                     max_size=2**20,  # 1MB max message
                 ) as ws:
                     self.ws = ws
+                    self._last_pong_time = time.monotonic()
+                    self._stats["connect_time"] = time.monotonic()
+                    if retry_count > 0:
+                        self._stats["reconnects"] += 1
                     retry_count = 0  # Reset on successful connect
                     log.info("✅ WebSocket connected for game=%s", self.game_id)
 
-                    # Start ping keepalive
+                    # Start ping keepalive + pong watchdog
                     self._ping_task = asyncio.create_task(self._ping_loop())
+                    self._pong_watchdog_task = asyncio.create_task(self._pong_watchdog())
 
                     # Message processing loop
                     async for raw_msg in ws:
@@ -116,8 +133,10 @@ class WebSocketEngine:
                                 continue
                             msg_type = msg.get("type", "unknown")
                             log.debug("WS recv: type=%s", msg_type)
+                            self._stats["messages_received"] += 1
                             result = await self._handle_message(msg)
                             if result is not None:
+                                self._log_game_stats()
                                 self._running = False
                                 return result
                         except json.JSONDecodeError:
@@ -125,20 +144,44 @@ class WebSocketEngine:
 
             except websockets.exceptions.ConnectionClosed as e:
                 retry_count += 1
-                log.warning("WebSocket closed: code=%s reason=%s (retry %d/%d)",
-                            e.code, e.reason, retry_count, max_retries)
-                if self._ping_task:
-                    self._ping_task.cancel()
-                await asyncio.sleep(min(2 ** retry_count, 30))
+                # Jitter backoff: base * 2^retry + random jitter
+                base_wait = min(2 ** retry_count, 30)
+                jitter = random.uniform(0, base_wait * 0.3)
+                wait = base_wait + jitter
+                log.warning("WebSocket closed: code=%s reason=%s (retry %d/%d, wait %.1fs)",
+                            e.code, e.reason, retry_count, max_retries, wait)
+                self._cleanup_tasks()
+                await asyncio.sleep(wait)
 
             except Exception as e:
                 retry_count += 1
-                log.error("WebSocket error: %s (retry %d/%d)", e, retry_count, max_retries)
-                if self._ping_task:
-                    self._ping_task.cancel()
-                await asyncio.sleep(min(2 ** retry_count, 30))
+                base_wait = min(2 ** retry_count, 30)
+                jitter = random.uniform(0, base_wait * 0.3)
+                wait = base_wait + jitter
+                log.error("WebSocket error: %s (retry %d/%d, wait %.1fs)",
+                          e, retry_count, max_retries, wait)
+                self._cleanup_tasks()
+                await asyncio.sleep(wait)
 
+        self._log_game_stats()
         return self.game_result or {"status": "disconnected"}
+
+    def _cleanup_tasks(self):
+        """Cancel background tasks on disconnect."""
+        if self._ping_task:
+            self._ping_task.cancel()
+        if self._pong_watchdog_task:
+            self._pong_watchdog_task.cancel()
+
+    def _log_game_stats(self):
+        """Log game session statistics."""
+        elapsed = time.monotonic() - self._stats["connect_time"] if self._stats["connect_time"] else 0
+        log.info("📊 Game Stats: msgs=%d actions=%d turns=%d uptime=%.0fs reconnects=%d",
+                 self._stats["messages_received"],
+                 self._stats["actions_sent"],
+                 self._stats["turns_played"],
+                 elapsed,
+                 self._stats["reconnects"])
 
     async def _handle_message(self, msg: dict) -> dict | None:
         """Process a single WebSocket message. Returns game result or None."""
@@ -203,6 +246,7 @@ class WebSocketEngine:
                 turn_num = msg["data"].get("turn", turn_num)
 
             log.info("Turn %s — processing view...", turn_num)
+            self._stats["turns_played"] += 1
             if view and isinstance(view, dict):
                 self.last_view = view
                 await self._on_agent_view(view)
@@ -230,7 +274,7 @@ class WebSocketEngine:
 
         # ── pong ──────────────────────────────────────────────────────
         elif msg_type == "pong":
-            pass
+            self._last_pong_time = time.monotonic()
 
         # ── error ─────────────────────────────────────────────────────
         elif msg_type == "error":
@@ -415,6 +459,7 @@ class WebSocketEngine:
         )
 
         await self._send(payload)
+        self._stats["actions_sent"] += 1
         log.info("→ %s | %s", action_type.upper(), reason)
 
         # Feed dashboard with action
@@ -439,6 +484,25 @@ class WebSocketEngine:
             pass
         except Exception as e:
             log.debug("Ping loop error: %s", e)
+
+    async def _pong_watchdog(self):
+        """Watch for pong timeouts — if no pong received in 45s, force reconnect.
+        This prevents the bot from silently hanging on dead connections.
+        """
+        try:
+            while self._running:
+                await asyncio.sleep(10)
+                if self._last_pong_time > 0:
+                    since_pong = time.monotonic() - self._last_pong_time
+                    if since_pong > 45:
+                        log.warning("⚠️ No pong for %.0fs — connection may be dead, forcing reconnect", since_pong)
+                        if self.ws:
+                            await self.ws.close()
+                        break
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.debug("Pong watchdog error: %s", e)
 """
 Per game-loop.md §9 Message Types:
 | Type              | Key Fields                                           |
@@ -452,3 +516,4 @@ Per game-loop.md §9 Message Types:
 | waiting           | gameId, agentId, message                             |
 | pong              | —                                                    |
 """
+

@@ -31,9 +31,9 @@ FORGE_ROUTER = "0x7aF414e4d373bb332f47769c8d28A446A0C1a1E8"
 WCROSS = "0xDdF8AaA3927b8Fd5684dc2edcc7287EcB0A2122d"
 REPUTATION_REGISTRY = "0x8004BAa17C55a88189AE136b182e5fdA19dE9b63"
 
-# ── Economy constants (from economy.md) ───────────────────────────────
+# ── Economy constants (from economy.md + strategy.md v1.5.2) ─────────
 PAID_ENTRY_FEE_MOLTZ = 500
-PAID_ENTRY_FEE_SMOLTZ = 500
+PAID_ENTRY_FEE_SMOLTZ = 100  # Per strategy.md v1.5.2: "reach 100 threshold"
 FREE_ROOM_POOL = 1000
 GUARDIAN_KILL_POOL_SHARE = 0.60  # 60%
 
@@ -70,4 +70,11 @@ AUTO_SC_WALLET = os.getenv("AUTO_SC_WALLET", "true").lower() == "true"       # Q
 ENABLE_MEMORY = os.getenv("ENABLE_MEMORY", "true").lower() == "true"         # Q7: cross-game learning
 ENABLE_AGENT_TOKEN = os.getenv("ENABLE_AGENT_TOKEN", "false").lower() == "true"  # Q8: agent token
 AUTO_IDENTITY = os.getenv("AUTO_IDENTITY", "true").lower() == "true"         # Q9: ERC-8004 auto-register
+
+# ── Strategy tuning (tweak via env vars without code changes) ────────
+AGGRESSION_LEVEL = os.getenv("AGGRESSION_LEVEL", "balanced")  # passive | balanced | aggressive
+HP_CRITICAL_THRESHOLD = int(os.getenv("HP_CRITICAL", "25"))     # HP below this = heal immediately
+HP_MODERATE_THRESHOLD = int(os.getenv("HP_MODERATE", "60"))     # HP below this = heal if safe
+GUARDIAN_FARM_MIN_HP = int(os.getenv("GUARDIAN_FARM_HP", "30"))  # Min HP to engage guardians
+COMBAT_MIN_EP = int(os.getenv("COMBAT_MIN_EP", "2"))            # Min EP for combat actions
 

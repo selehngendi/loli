@@ -3,16 +3,21 @@ Free game join via matchmaking queue.
 POST /join (Long Poll ~15s) → assigned → open WS immediately.
 No extra sleep between retries per free-games.md.
 """
+import time
 from bot.api_client import MoltyAPI, APIError
 from bot.utils.logger import get_logger
 
 log = get_logger(__name__)
+
+MAX_QUEUE_ATTEMPTS = 100       # Max attempts before giving up
+MAX_QUEUE_TIME_SECONDS = 900   # 15 minutes max queuing time
 
 
 async def join_free_game(api: MoltyAPI) -> tuple[str, str]:
     """
     Enter free matchmaking queue and wait for assignment.
     Returns (game_id, agent_id) when assigned.
+    Raises RuntimeError if max retries or timeout exceeded.
     """
     # Idempotency guard: check queue status first
     try:
@@ -30,14 +35,27 @@ async def join_free_game(api: MoltyAPI) -> tuple[str, str]:
     except APIError:
         pass
 
-    # Queue loop — no extra sleep, server Long Poll throttles (per free-games.md)
+    # Queue loop — server Long Poll throttles (per free-games.md)
     attempt = 0
-    while True:
+    start_time = time.monotonic()
+    consecutive_errors = 0
+
+    while attempt < MAX_QUEUE_ATTEMPTS:
+        # Check total time limit
+        elapsed = time.monotonic() - start_time
+        if elapsed > MAX_QUEUE_TIME_SECONDS:
+            raise RuntimeError(
+                f"Free queue timeout after {elapsed:.0f}s ({attempt} attempts). "
+                "Server may be congested — will retry next heartbeat cycle."
+            )
+
         attempt += 1
-        log.info("Free queue attempt #%d...", attempt)
+        log.info("Free queue attempt #%d (%.0fs elapsed)...", attempt, elapsed)
 
         try:
             resp = await api.post_join("free")
+            consecutive_errors = 0  # Reset on success
+
             if not isinstance(resp, dict):
                 log.warning("Unexpected join response type: %s", type(resp).__name__)
                 continue
@@ -48,7 +66,8 @@ async def join_free_game(api: MoltyAPI) -> tuple[str, str]:
                 gid = resp.get("gameId", "")
                 aid = resp.get("agentId", "")
                 if gid and aid:
-                    log.info("✅ Assigned to free game: %s (agent=%s)", gid, aid)
+                    log.info("✅ Assigned to free game: %s (agent=%s) after %d attempts",
+                             gid, aid, attempt)
                     return gid, aid
                 log.warning("Assigned but missing gameId/agentId: %s", resp)
 
@@ -71,4 +90,9 @@ async def join_free_game(api: MoltyAPI) -> tuple[str, str]:
             if e.code == "ACCOUNT_ALREADY_IN_GAME":
                 log.info("Already in a game. Returning to heartbeat.")
                 raise
-            log.warning("Join error: %s — retrying", e)
+            consecutive_errors += 1
+            if consecutive_errors >= 5:
+                raise RuntimeError(f"Too many consecutive queue errors ({consecutive_errors}): {e}")
+            log.warning("Join error: %s (consecutive=%d) — retrying", e, consecutive_errors)
+
+    raise RuntimeError(f"Free queue exhausted after {MAX_QUEUE_ATTEMPTS} attempts")

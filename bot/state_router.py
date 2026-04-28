@@ -2,6 +2,7 @@
 State router — determines agent state from GET /accounts/me response.
 Routes per skill.md State Router logic.
 """
+from bot.config import PAID_ENTRY_FEE_SMOLTZ
 from bot.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -42,11 +43,11 @@ def determine_state(me_response: dict) -> tuple[str, dict]:
         log.info("No ERC-8004 identity registered")
         return NO_IDENTITY, {}
 
-    # Check paid readiness
+    # Check paid readiness — threshold per strategy.md v1.5.2
     if readiness.get("paidReady", False):
         balance = me_response.get("balance", 0)
-        if balance >= 500:  # PAID_ENTRY_FEE_SMOLTZ from economy.md
-            log.info("Paid ready: balance=%d sMoltz", balance)
+        if balance >= PAID_ENTRY_FEE_SMOLTZ:
+            log.info("Paid ready: balance=%d sMoltz (threshold=%d)", balance, PAID_ENTRY_FEE_SMOLTZ)
             return READY_PAID, {"balance": balance}
 
     # Default to free
