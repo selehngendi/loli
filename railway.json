@@ -7,6 +7,48 @@
   "deploy": {
     "startCommand": "python -m bot.main",
     "restartPolicyType": "ON_FAILURE",
-    "restartPolicyMaxRetries": 10
+    "restartPolicyMaxRetries": 10,
+    "envVars": {
+      "AGENT_NAME": {
+        "description": "Nama bot agent (max 50 chars)",
+        "required": true
+      },
+      "RAILWAY_API_TOKEN": {
+        "description": "Railway API Token untuk auto-sync credentials. Buat di: https://railway.com/account/tokens",
+        "required": true
+      },
+      "ROOM_MODE": {
+        "description": "Mode room: free / auto / paid",
+        "default": "free"
+      },
+      "LOG_LEVEL": {
+        "description": "Level logging: DEBUG / INFO / WARNING",
+        "default": "INFO"
+      },
+      "ADVANCED_MODE": {
+        "description": "Auto-generate Owner+Agent wallet",
+        "default": "true"
+      },
+      "AUTO_WHITELIST": {
+        "description": "Auto-check + auto-approve whitelist",
+        "default": "true"
+      },
+      "AUTO_SC_WALLET": {
+        "description": "Auto-create MoltyRoyale SC Wallet",
+        "default": "true"
+      },
+      "ENABLE_MEMORY": {
+        "description": "Cross-game learning",
+        "default": "true"
+      },
+      "ENABLE_AGENT_TOKEN": {
+        "description": "Agent token registration",
+        "default": "false"
+      },
+      "AUTO_IDENTITY": {
+        "description": "Auto-register ERC-8004 identity",
+        "default": "true"
+      }
+    }
   }
 }
